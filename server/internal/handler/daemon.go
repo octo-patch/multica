@@ -331,7 +331,8 @@ func (h *Handler) ListPendingTasksByRuntime(w http.ResponseWriter, r *http.Reque
 // ---------------------------------------------------------------------------
 
 // authorizeTaskWorkspace verifies the authenticated user is a member of the
-// workspace that owns the given task (resolved via the task's issue).
+// workspace that owns the given task. The workspace is resolved via the task's
+// issue (for issue tasks) or chat session (for chat tasks).
 // Returns true if authorized; writes an HTTP error and returns false otherwise.
 func (h *Handler) authorizeTaskWorkspace(w http.ResponseWriter, r *http.Request, taskID pgtype.UUID) bool {
 	task, err := h.Queries.GetAgentTask(r.Context(), taskID)
@@ -340,21 +341,35 @@ func (h *Handler) authorizeTaskWorkspace(w http.ResponseWriter, r *http.Request,
 		return false
 	}
 
-	if !task.IssueID.Valid {
-		// Chat-only tasks without an issue — fall back to agent's workspace.
-		// For now, allow; the agent table doesn't carry workspace_id directly
-		// on the task, so we cannot check. This is acceptable because chat
-		// tasks are a separate, lower-risk path.
-		return true
+	workspaceID := ""
+
+	// Resolve workspace via issue.
+	if task.IssueID.Valid {
+		issue, err := h.Queries.GetIssue(r.Context(), task.IssueID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "task not found")
+			return false
+		}
+		workspaceID = uuidToString(issue.WorkspaceID)
 	}
 
-	issue, err := h.Queries.GetIssue(r.Context(), task.IssueID)
-	if err != nil {
+	// Fallback: resolve workspace via chat session.
+	if workspaceID == "" && task.ChatSessionID.Valid {
+		cs, err := h.Queries.GetChatSession(r.Context(), task.ChatSessionID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "task not found")
+			return false
+		}
+		workspaceID = uuidToString(cs.WorkspaceID)
+	}
+
+	if workspaceID == "" {
+		// Orphan task with neither issue nor chat session — deny by default.
 		writeError(w, http.StatusNotFound, "task not found")
 		return false
 	}
 
-	_, ok := h.requireWorkspaceMember(w, r, uuidToString(issue.WorkspaceID), "task not found")
+	_, ok := h.requireWorkspaceMember(w, r, workspaceID, "task not found")
 	return ok
 }
 
@@ -386,6 +401,10 @@ type TaskProgressRequest struct {
 
 func (h *Handler) ReportTaskProgress(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
+
+	if !h.authorizeTaskWorkspace(w, r, parseUUID(taskID)) {
+		return
+	}
 
 	var req TaskProgressRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -453,6 +472,10 @@ type TaskUsagePayload struct {
 func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
+	if !h.authorizeTaskWorkspace(w, r, parseUUID(taskID)) {
+		return
+	}
+
 	var req struct {
 		Usage []TaskUsagePayload `json:"usage"`
 	}
@@ -482,6 +505,11 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 // Used by the daemon to check whether a task was cancelled mid-execution.
 func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
+
+	if !h.authorizeTaskWorkspace(w, r, parseUUID(taskID)) {
+		return
+	}
+
 	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
 	if err != nil {
 		writeError(w, http.StatusNotFound, "task not found")
@@ -539,6 +567,10 @@ type TaskMessageBatchRequest struct {
 // ReportTaskMessages receives a batch of agent execution messages from the daemon.
 func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
+
+	if !h.authorizeTaskWorkspace(w, r, parseUUID(taskID)) {
+		return
+	}
 
 	var req TaskMessageBatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -608,6 +640,10 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 // ListTaskMessages returns the persisted messages for a task (for catch-up after reconnect).
 func (h *Handler) ListTaskMessages(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
+
+	if !h.authorizeTaskWorkspace(w, r, parseUUID(taskID)) {
+		return
+	}
 
 	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
 	if err != nil {
